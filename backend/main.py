@@ -49,7 +49,24 @@ class AlternativeBookingRequest(BaseModel):
 
 # --- In-Memory Storage ---
 booking_sessions: Dict[str, BookingRequest] = {}
-booked_orders: List[Dict] = []
+booked_orders: List[Dict] = [
+    {
+        "id": "TRX1722784264",
+        "isAlternative": False,
+        "trainId": "KAI001",
+        "trainName": "Argo Bromo Anggrek",
+        "origin": "Jakarta",
+        "destination": "Surabaya",
+        "date": "2024-08-15",
+        "time": "08:00",
+        "passengers": 1,
+        "price": 500000,
+        "status": "confirmed",
+        "passengersInfo": [{"name": "John Doe", "idNumber": "1234567890"}],
+        "refundStatus": None,
+        "legs": []
+    }
+]
 
 # --- Mock Data (with city information) ---
 mock_trains = [
@@ -104,7 +121,7 @@ def normalize_city(city_name: str) -> str:
     }
     return city_map.get(city_name.lower().strip(), city_name.lower().strip())
 
-def search_trains(origin: str, destination: str, date: str):
+def search_trains(origin: str, destination: str, date: str, passengers: int = 1):
     """
     Searches for direct trains based on origin, destination, and date.
     Returns a list of deep copies of matching trains.
@@ -163,6 +180,61 @@ def find_alternative_routes(origin: str, destination: str, date: str):
 
     return found_routes
 
+def get_order_status(order_id: str):
+    """Looks up an order by its ID and returns its status."""
+    print(f"Searching for order with ID: {order_id}")
+    for order in booked_orders:
+        if order.get("id") == order_id:
+            return {
+                "status": "success",
+                "order_id": order_id,
+                "train_name": order["trainName"],
+                "destination": order["destination"],
+            }
+
+def book_ticket_from_chat(train_id: str, date: str, passengers: int, passengers_info: List[Dict]):
+    """Books a ticket from the chatbot, creating an order and storing it."""
+    selected_train = next((train for train in mock_trains if train['train_id'] == train_id), None)
+
+    if not selected_train:
+        return {"status": "error", "message": f"Train with ID {train_id} not found."}
+
+    order_id = f"TRX{int(datetime.datetime.now().timestamp())}"
+    
+    new_order = {
+        "id": order_id,
+        "isAlternative": False,
+        "trainId": train_id,
+        "trainName": selected_train["train_name"],
+        "origin": selected_train["departure"]["city"],
+        "destination": selected_train["arrival"]["city"],
+        "date": date,
+        "time": selected_train["departure"]["time"],
+        "passengers": passengers,
+        "price": selected_train["price"] * passengers,
+        "status": "confirmed",
+        "passengersInfo": passengers_info,
+        "refundStatus": None,
+        "legs": []
+    }
+
+    booked_orders.append(new_order)
+    print(f"Successfully booked order via chat: {order_id}")
+    
+    return {
+        "status": "success",
+        "order_id": order_id,
+        "train_name": new_order["trainName"],
+        "destination": new_order["destination"],
+    }
+
+# --- TAMBAHKAN DICTIONARY INI UNTUK MEMETAKAN FUNGSI ---
+available_functions = {
+    "search_trains": search_trains,
+    "find_alternative_routes": find_alternative_routes,
+    "get_order_status": get_order_status,
+    "book_ticket_from_chat": book_ticket_from_chat,
+}
 
 class SearchRequest(BaseModel):
     origin: str
@@ -183,7 +255,11 @@ class AlternativeBookingRequest(BaseModel):
 # --- FastAPI App Setup ---
 app = FastAPI()
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware,
+    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --- API Endpoints ---
@@ -254,6 +330,57 @@ async def book_alternative_route(request: AlternativeBookingRequest):
 async def get_my_orders():
     return booked_orders
 
+@app.post("/api/chat")
+async def chat_endpoint(request: ChatRequest):
+    try:
+        if not model:
+            raise HTTPException(status_code=500, detail="GenerativeAI model not initialized.")
+
+        # Build a valid history for the model
+        history = []
+        for message in request.conversation_history:
+            role = "user" if message.get("role") == "user" else "model"
+            content = message.get("content") or ""
+            history.append({"role": role, "parts": [{"text": content}]})
+
+        chat = model.start_chat(history=history)
+        response = chat.send_message(request.message)
+
+        # Loop to handle function calls from the model
+        while response.candidates[0].content.parts[0].function_call:
+            function_call = response.candidates[0].content.parts[0].function_call
+            function_name = function_call.name
+            args = dict(function_call.args)
+
+            if function_name in available_functions:
+                function_to_call = available_functions[function_name]
+                function_response = function_to_call(**args)
+
+                # Send the function's result back to the model
+                response = chat.send_message(
+                    genai.types.Part.from_function_response(
+                        name=function_name,
+                        response=function_response,
+                    ),
+                )
+            else:
+                # Handle case where the model calls a function that doesn't exist
+                response = chat.send_message(
+                     genai.types.Part.from_function_response(
+                        name=function_name,
+                        response={"status": "error", "message": f"Function '{function_name}' is not available."}
+                    ),
+                )
+        
+        # Once the loop is done, the final response is text
+        final_response = response.text
+        return {"content": final_response}
+
+    except Exception as e:
+        # Broad exception handler to prevent server crashes
+        print(f"Error in /api/chat endpoint: {e}")
+        raise HTTPException(status_code=500, detail="An internal error occurred in the chat service.")
+
 
 @app.post("/api/submit-order")
 async def submit_order(order: dict):
@@ -302,7 +429,42 @@ try:
                         },
                         "required": ["origin", "destination", "date"]
                     }
+                },
+                {
+                    "name": "get_order_status",
+                    "description": "Get the current status of a booking order using its Order ID.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "order_id": {"type": "STRING", "description": "The unique ID of the order, e.g., 'TRX1722784264'"}
+                        },
+                        "required": ["order_id"]
+                    }
+                },
+                {
+                "name": "book_ticket_from_chat",
+                "description": "Books a train ticket after user has selected a train and provided all passenger details.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "train_id": {"type": "STRING", "description": "The ID of the selected train, e.g., 'KAI001'."},
+                        "date": {"type": "STRING", "description": "The date of travel in YYYY-MM-DD format."},
+                        "passengers": {"type": "INTEGER", "description": "The total number of passengers."},
+                        "passengers_info": {
+                            "type": "ARRAY",
+                            "description": "A list of passenger details.",
+                            "items": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "name": {"type": "STRING", "description": "Full name of the passenger."},
+                                    "idNumber": {"type": "STRING", "description": "ID number of the passenger."}
+                                }
+                            }
+                        }
+                    },
+                    "required": ["train_id", "date", "passengers", "passengers_info"]
                 }
+            }
             ]
         }
     ]
@@ -311,12 +473,17 @@ try:
     You are KAI Assistant, a friendly and helpful AI for booking train tickets in Indonesia.
     **Core Instructions:**
     1.  **Detect Language**: You MUST detect the user's language (English or Indonesian). Your responses MUST be in the same language.
-    2.  **Booking Flow**: When a user wants to book a ticket, use the `search_trains` function. Do not ask for origin, destination, and date separately. Ask for all three at once if they are not provided.
-    3.  **Alternative Routes**: If `search_trains` returns no results, use the `find_alternative_routes` function.
-    4.  **Be Concise**: Keep your answers short and to the point.
+    2.  **Be Concise and Friendly**: Keep your responses brief and helpful.
+    3.  **Booking Flow**:
+        a. **Search**: When a user wants to book a ticket, first use the `search_trains` function. If it returns no results, use `find_alternative_routes`.
+        b. **Selection**: After showing the results, ask the user to select one train.
+        c. **Collect Passenger Data**: Once a train is selected, you MUST ask for passenger details ONE BY ONE. Start by asking for the name and ID of "Passenger 1". After you get it, ask for "Passenger 2", and so on, until you have details for the correct number of passengers.
+        d. **Finalize**: After collecting ALL passenger details, you MUST call the `book_ticket_from_chat` function with all the gathered information (train_id, date, passengers, passengers_info).
+        e. **Confirmation**: After calling the booking function, confirm the booking success and provide the Order ID to the user.
+    4.  **Other Tools**: Use `get_order_status` if the user asks about an existing order.
     """
     model = genai.GenerativeModel(
-        model_name='gemini-1.5-flash-latest', 
+        model_name='gemini-flash-latest', 
         system_instruction=SYSTEM_INSTRUCTION,
         tools=tools
     )
